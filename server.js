@@ -3,7 +3,6 @@ const { v4: uuidV4 } = require('uuid');
 const express = require('express');
 const morgan = require('morgan');
 const { Server } = require('socket.io');
-const jwt = require('jsonwebtoken');
 
 require('dotenv').config();
 
@@ -17,30 +16,35 @@ const io = new Server(httpServer, {
 });
 
 let tunnelSockets = {};
+// creates map of applicationName<->ApiKey
+let apiKeyMap = {};
 
 io.use((socket, next) => {
   const connectHost = socket.handshake.headers.host;
-  if (tunnelSockets[connectHost]) {
-    return next(new Error(`${connectHost} has a existing connection`));
+  if (!socket.handshake.query || !socket.handshake.query['appName']){
+    next(new Error('Authentication error, missing application name or authentication token'));
+  }
+  const appName = socket.handshake.query['appName'];
+  
+  if (tunnelSockets[appName]) {
+    return next(new Error(`${appName} app running on host ${connectHost} has a existing connection`));
   }
   if (!socket.handshake.auth || !socket.handshake.auth.token){
-    next(new Error('Authentication error'));
+    next(new Error('Authentication error , missing application name or authentication token'));
   }
-  jwt.verify(socket.handshake.auth.token, process.env.SECRET_KEY, function(err, decoded) {
-    if (err) {
-      return next(new Error('Authentication error'));
-    }
-    if (decoded.token !== process.env.VERIFY_TOKEN) {
-      return next(new Error('Authentication error'));
-    }
-    next();
-  });  
+  
+  if(!apiKeyMap[appName]) {
+    next(new Error(`Authentication error, ${appName} application authentication details are not configured on the server`));
+  }
+  next();
+
 });
 
 io.on('connection', (socket) => {
   const connectHost = socket.handshake.headers.host;
-  tunnelSockets[connectHost] = socket;
-  console.log(`client connected at ${connectHost}`);
+  const appName = socket.handshake.query['appName'];
+  tunnelSockets[appName] = socket;
+  console.log(`client connected at ${connectHost} with appname ${appName}`);
   const onMessage = (message) => {
     if (message === 'ping') {
       socket.send('pong');
@@ -48,7 +52,7 @@ io.on('connection', (socket) => {
   }
   const onDisconnect = (reason) => {
     console.log('client disconnected: ', reason);
-    delete tunnelSockets[connectHost];
+    delete tunnelSockets[appName];
     socket.off('message', onMessage);
   };
   socket.on('message', onMessage);
@@ -56,24 +60,6 @@ io.on('connection', (socket) => {
 });
 
 app.use(morgan('tiny'));
-app.get('/tunnel_jwt_generator', (req, res) => {
-  if (!process.env.JWT_GENERATOR_USERNAME || !process.env.JWT_GENERATOR_PASSWORD) {
-    res.status(404);
-    res.send('Not found');
-    return;
-  }
-  if (
-    req.query.username === process.env.JWT_GENERATOR_USERNAME &&
-    req.query.password === process.env.JWT_GENERATOR_PASSWORD
-  ) {
-    const jwtToken = jwt.sign({ token: process.env.VERIFY_TOKEN }, process.env.SECRET_KEY);
-    res.status(200);
-    res.send(jwtToken);
-    return;
-  }
-  res.status(401);
-  res.send('Forbidden');
-});
 
 function getReqHeaders(req) {
   const encrypted = !!(req.isSpdy || req.connection.encrypted || req.connection.pair);
@@ -93,8 +79,9 @@ function getReqHeaders(req) {
   return headers;
 }
 
-app.use('/', (req, res) => {
-  const tunnelSocket = tunnelSockets[req.headers.host];
+app.use('/:appName', (req, res) => {
+  const applicationName = req.params["appName"];
+  const tunnelSocket = tunnelSockets[applicationName];
   if (!tunnelSocket) {
     res.status(404);
     res.send('Not Found');
@@ -170,8 +157,9 @@ httpServer.on('upgrade', (req, socket, head) => {
     return;
   }
   console.log(`WS ${req.url}`);
+  const appName = socket.handshake.query['appName'];
   // proxy websocket request
-  const tunnelSocket = tunnelSockets[req.headers.host];
+  const tunnelSocket = tunnelSockets[appName];
   if (!tunnelSocket) {
     return;
   }
@@ -235,6 +223,13 @@ httpServer.on('upgrade', (req, socket, head) => {
   tunnelResponse.once('requestError', onRequestError)
   tunnelResponse.once('response', onResponse);
 });
-
+// creates map of API<->ApiKey
+// APIKEYS=appName1:apiKey1,appName2:apiKey2
+if ( process.env.APIKEYS) {
+  process.env.APIKEYS.split(",").forEach( function(item) {
+    let values = item.split(":");
+    apiKeyMap[values[0]] = values[1];
+  })
+}
 httpServer.listen(process.env.PORT || 3000);
 console.log(`app start at http://localhost:${process.env.PORT || 3000}`);
